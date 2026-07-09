@@ -5,54 +5,85 @@ A transparent gateway that sits in front of [Ollama](https://ollama.com).
 It forwards every request byte-for-byte unchanged, so it's a drop-in
 replacement for Ollama's own address — point any existing client at
 llamagate instead of Ollama directly, and it keeps working exactly as
-before. Llamagate observes traffic in transit to add capabilities Ollama
-doesn't have natively.
+before. That includes chat UIs **and** autonomous agents (tool-calling
+loops, multi-step workflows, background jobs): anything that talks to
+Ollama over HTTP goes through the same gate. Llamagate observes traffic
+in transit to add capabilities Ollama doesn't have natively.
 
 **Today:** token usage counting (today + all-time), persisted to disk and
-safe under concurrent requests.
+safe under concurrent requests — across chat *and* agent traffic.
 
 **Roadmap:** llamagate is built as the foundation for an observability and
 security layer in front of Ollama — request logging, per-client usage
 breakdowns, rate limiting, and access control are natural next steps, all
 without requiring clients to change how they connect.
 
+## Motivation
+
+Llamagate was born out of a home AI lab running Ollama on an NVIDIA DGX
+Spark — a small, single-box environment where Ollama serves multiple
+clients (a chat UI, autonomous agents, scripts) but has no way to see,
+measure, or govern what's actually happening across all of them.
+
+That's a common gap in small, self-hosted environments like this: Ollama
+is trivial to get running, but observability and security are left as an
+exercise for whoever's running it. Llamagate exists to fill that gap
+incrementally — starting with the simplest possible signal (token counts),
+and growing toward fuller observability and security as the project
+develops, without ever requiring clients to change how they connect.
+
+As this grows beyond a single-lab tool, the goal is for llamagate to work
+for anyone running Ollama in a similarly small, self-managed environment —
+not just large-scale deployments that already have enterprise observability
+stacks available to them.
+
+**Blog post:** [Llamagate: A Gateway in Front of My Home Lab's Ollama](https://www.niran.ai/blog/llamagate-ollama-gateway) — the full backstory on [niran.ai](https://www.niran.ai): DGX Spark, Open WebUI, NemoClaw, and why token counting was just the start.
+
 ## Why a gateway instead of modifying Ollama itself?
 
 Ollama has no built-in cumulative token counter, request log, or access
 control across requests. Rather than patching Ollama or asking every client
 to implement this themselves, a gateway is the single place that sees *all*
-traffic regardless of which client sent it — chat UIs, autonomous agents,
-curl scripts, anything — and the natural place to enforce policy later.
+traffic regardless of which client sent it — interactive chat, long-running
+agents, curl scripts, anything — and the natural place to enforce policy
+later. Agents especially matter here: a single agent run can issue many
+model calls, so counting and (eventually) controlling that traffic at the
+gateway is more reliable than relying on each agent framework to report
+usage itself.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Clients
+    subgraph Clients["Clients — chat and agents"]
         A[Chat UI]
-        B[Agent / automation]
+        B[Autonomous agents<br/>tool loops / workflows]
         C[Scripts / curl]
     end
 
     subgraph "llamagate"
-        P[Gateway]
+        P[Gateway<br/>all traffic]
         T[(token_counts.json)]
     end
 
     O[Ollama<br/>real backend]
 
-    A -->|HTTP requests| P
-    B -->|HTTP requests| P
-    C -->|HTTP requests| P
+    A -->|chat completions| P
+    B -->|agent model calls| P
+    C -->|ad-hoc requests| P
 
     P -->|forwarded unchanged| O
     O -->|response stream| P
-    P -->|passthrough to client| A
-    P -->|passthrough to client| B
-    P -->|passthrough to client| C
+    P -->|passthrough| A
+    P -->|passthrough| B
+    P -->|passthrough| C
 
     P -.->|parses token counts<br/>from recognized paths| T
 ```
+
+Chat sessions and agent runs share the same path through llamagate — there
+is no separate agent pipeline. Every HTTP client that would have talked to
+Ollama talks to llamagate instead.
 
 **Key design point:** llamagate inspects response streams for two known
 formats in order to count tokens, but always forwards the *original* bytes
@@ -120,8 +151,8 @@ to a different port first**, since they can't both use the same one. See
 
 The common setup: move Ollama to an internal-only port, and let llamagate
 occupy Ollama's original, well-known port. This way every existing client
-already pointed at "Ollama's address" gets gatewayed — and counted — with
-zero reconfiguration on the client side.
+already pointed at "Ollama's address" — chat UIs, agents, scripts — gets
+gatewayed and counted with zero reconfiguration on the client side.
 
 ```bash
 # 1. Move Ollama off its default port (example: systemd override)
