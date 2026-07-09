@@ -1,0 +1,17 @@
+[Unit]
+Description=llamagate - gateway in front of Ollama
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/path/to/llamagate
+Environment="OLLAMA_UPSTREAM_URL=http://127.0.0.1:11436"
+Environment="LLAMAGATE_COUNTS_FILE=/path/to/llamagate/token_counts.json"
+ExecStart=/usr/bin/python3 -m gunicorn --workers 1 --threads 8 --bind 127.0.0.1:11434 --timeout 300 llamagate:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
