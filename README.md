@@ -93,7 +93,7 @@ Ollama directly.
 | Path pattern | Format | How tokens are counted |
 |---|---|---|
 | `/api/generate`, `/api/chat` | Ollama native NDJSON | Final chunk (`done: true`) includes `eval_count` + `prompt_eval_count` |
-| `/v1/chat/completions`, `/v1/completions` | OpenAI-compatible SSE | `usage` field, when present, in a `data: {...}` chunk |
+| `/v1/chat/completions`, `/v1/completions` | OpenAI-compatible SSE | last `usage` object in the finished stream (running totals are not summed) |
 | Everything else | N/A | Passed through untouched, uncounted |
 
 ### Where this is headed
