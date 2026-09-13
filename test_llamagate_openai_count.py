@@ -3,7 +3,29 @@
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
+
+flask = types.ModuleType("flask")
+
+
+class _Flask:
+    def __init__(self, *a, **k):
+        pass
+
+    def route(self, *a, **k):
+        def deco(fn):
+            return fn
+
+        return deco
+
+
+flask.Flask = _Flask
+flask.request = None
+flask.Response = object
+flask.stream_with_context = lambda x: x
+sys.modules["flask"] = flask
+sys.modules.setdefault("requests", types.ModuleType("requests"))
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("llamagate", ROOT / "llamagate.py")
@@ -30,6 +52,19 @@ def test_sse_with_usage():
         b"data: [DONE]\n\n"
     )
     assert lg._extract_tokens_from_sse_chunk(chunk) == 7
+
+
+def test_sse_repeated_usage_counts_once():
+    """Running totals on every frame must not be summed."""
+    chunk = (
+        b'data: {"choices":[{"delta":{"content":"a"}}],'
+        b'"usage":{"prompt_tokens":6000,"completion_tokens":1}}\n\n'
+        b'data: {"choices":[{"delta":{"content":"b"}}],'
+        b'"usage":{"prompt_tokens":6000,"completion_tokens":2}}\n\n'
+        b'data: {"choices":[],"usage":{"prompt_tokens":6000,"completion_tokens":3}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    assert lg._extract_tokens_from_sse_chunk(chunk) == 6003
 
 
 def test_sse_without_usage():
@@ -65,6 +100,7 @@ def test_inject_noop_when_not_streaming():
 if __name__ == "__main__":
     test_nonstream_json()
     test_sse_with_usage()
+    test_sse_repeated_usage_counts_once()
     test_sse_without_usage()
     test_inject_stream_usage()
     test_inject_noop_when_already_set()

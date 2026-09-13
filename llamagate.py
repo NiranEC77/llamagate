@@ -127,14 +127,18 @@ def _extract_tokens_from_ndjson_line(line):
 
 
 def _extract_tokens_from_sse_chunk(chunk_bytes):
-    """OpenAI-compatible endpoints (/v1/chat/completions, /v1/completions)
-    stream Server-Sent Events. A 'usage' field, when present, is usually
-    only on the final chunk (and only if the client requested it)."""
+    """OpenAI-compatible SSE. Count usage once — the last usage object.
+
+    Some servers (and our own include_usage injection) repeat a running
+    usage on many frames. Adding every frame made the public counter
+    read tens of millions in a day while the company ledger stayed in
+    the hundreds of thousands.
+    """
     try:
         text = chunk_bytes.decode("utf-8", errors="ignore")
     except Exception:
         return 0
-    total = 0
+    last = 0
     for line in text.split("\n"):
         line = line.strip()
         if not line.startswith("data:"):
@@ -147,9 +151,12 @@ def _extract_tokens_from_sse_chunk(chunk_bytes):
         except Exception:
             continue
         usage = obj.get("usage")
-        if usage:
-            total += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-    return total
+        if not isinstance(usage, dict):
+            continue
+        last = int(usage.get("prompt_tokens", 0) or 0) + int(
+            usage.get("completion_tokens", 0) or 0
+        )
+    return last
 
 
 def _extract_tokens_from_openai_json(body_bytes):
@@ -245,17 +252,18 @@ def proxy(path):
 
     elif clean_path in SSE_COUNTABLE_PATHS:
         def generate():
-            # Buffer the body so we can fall back to non-streaming JSON
-            # parsing when the client did not use SSE (the common case).
-            total = 0
+            # Buffer the body. Count once from the finished stream so a
+            # usage object split across 1 KiB chunks, or repeated on
+            # every frame, is not added over and over.
             buf = bytearray()
             for chunk in upstream_resp.iter_content(chunk_size=1024):
                 if chunk:
                     buf.extend(chunk)
-                    total += _extract_tokens_from_sse_chunk(chunk)
                     yield chunk
-            if total <= 0 and buf:
-                total = _extract_tokens_from_openai_json(bytes(buf))
+            body = bytes(buf)
+            total = _extract_tokens_from_sse_chunk(body)
+            if total <= 0:
+                total = _extract_tokens_from_openai_json(body)
             if total > 0:
                 _add_tokens(total)
 
