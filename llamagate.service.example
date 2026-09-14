@@ -9,6 +9,9 @@ User=CHANGE_ME
 WorkingDirectory=/path/to/llamagate
 Environment="OLLAMA_UPSTREAM_URL=http://127.0.0.1:11436"
 Environment="LLAMAGATE_COUNTS_FILE=/path/to/llamagate/token_counts.json"
+Environment="LLAMAGATE_DEMO_CIDRS=172.16.0.0/16"
+Environment="LLAMAGATE_DEMO_KEYS=ollama"
+Environment="LLAMAGATE_DEMO_LEASE_SEC=90"
 ExecStart=/usr/bin/python3 -m gunicorn --workers 1 --threads 8 --bind 127.0.0.1:11434 --timeout 300 llamagate:app
 Restart=always
 RestartSec=5

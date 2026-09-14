@@ -22,6 +22,7 @@ README.md.
 """
 
 from flask import Flask, request, Response, stream_with_context
+import ipaddress
 import requests
 import json
 import os
@@ -43,8 +44,187 @@ COUNTS_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_counts.json"),
 )
 UPSTREAM_TIMEOUT = int(os.environ.get("LLAMAGATE_UPSTREAM_TIMEOUT", "300"))
+# High-priority clients (Tanzu talk / nest) preempt bulk (Paperclip, UIs).
+# One Ollama slot. A bulk 32k prompt otherwise 400s the talk at ~60s.
+DEMO_CIDRS_RAW = os.environ.get("LLAMAGATE_DEMO_CIDRS", "172.16.0.0/16")
+DEMO_KEYS_RAW = os.environ.get("LLAMAGATE_DEMO_KEYS", "ollama")
+DEMO_LEASE_SEC = int(os.environ.get("LLAMAGATE_DEMO_LEASE_SEC", "90"))
+BULK_WAIT_SEC = int(os.environ.get("LLAMAGATE_BULK_WAIT_SEC", "180"))
+DEMO_WAIT_SEC = int(os.environ.get("LLAMAGATE_DEMO_WAIT_SEC", "30"))
 
 _lock = threading.Lock()
+GPU_PATHS = {
+    "v1/chat/completions",
+    "v1/completions",
+    "api/chat",
+    "api/generate",
+}
+
+
+def _parse_cidrs(raw):
+    out = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            continue
+    return out
+
+
+def _parse_keys(raw):
+    return {p.strip() for p in (raw or "").split(",") if p.strip()}
+
+
+DEMO_CIDRS = _parse_cidrs(DEMO_CIDRS_RAW)
+DEMO_KEYS = _parse_keys(DEMO_KEYS_RAW)
+
+
+def _bearer_token(authorization):
+    raw = (authorization or "").strip()
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    return raw
+
+
+def classify_client(remote_addr, authorization="", class_header=""):
+    """high = talk/demo. bulk = Paperclip and everything else."""
+    header = (class_header or "").strip().lower()
+    if header in {"high", "demo"}:
+        return "high"
+    if header in {"bulk", "low", "paperclip"}:
+        return "bulk"
+    token = _bearer_token(authorization)
+    if token and token in DEMO_KEYS:
+        return "high"
+    try:
+        ip = ipaddress.ip_address((remote_addr or "").split("%")[0])
+    except ValueError:
+        return "bulk"
+    for net in DEMO_CIDRS:
+        if ip in net:
+            return "high"
+    return "bulk"
+
+
+class Preempted(Exception):
+    """Bulk call was cancelled so a high-priority client can run."""
+
+
+class GpuSlot:
+    """One generation slot. high preempts bulk. high lease keeps bulk out
+    between talk turns so Agent Builder can call a tool and speak."""
+
+    def __init__(self, lease_sec=DEMO_LEASE_SEC):
+        self.cv = threading.Condition()
+        self.holder = None
+        self.ticket = 0
+        self.cancelled = False
+        self.session = None
+        self.upstream = None
+        self.demo_until = 0.0
+        self.preempts = 0
+        self.lease_sec = int(lease_sec)
+
+    def snapshot(self):
+        with self.cv:
+            remaining = max(0.0, self.demo_until - time.time())
+            return {
+                "holder": self.holder,
+                "demo_lease_remaining_sec": round(remaining, 1),
+                "preempts": self.preempts,
+            }
+
+    def acquire(self, cls, wait_sec):
+        deadline = time.time() + max(0.0, float(wait_sec))
+        with self.cv:
+            while True:
+                now = time.time()
+                if cls == "high":
+                    if self.holder == "bulk":
+                        self._cancel_locked()
+                    elif self.holder is None:
+                        return self._take_locked("high")
+                elif self.holder is None and now >= self.demo_until:
+                    return self._take_locked("bulk")
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                self.cv.wait(timeout=min(remaining, 0.25))
+
+    def _take_locked(self, cls):
+        self.ticket += 1
+        self.holder = cls
+        self.cancelled = False
+        self.session = None
+        self.upstream = None
+        if cls == "high":
+            self.demo_until = time.time() + self.lease_sec
+        return self.ticket
+
+    def _cancel_locked(self):
+        self.cancelled = True
+        self.preempts += 1
+        if self.upstream is not None:
+            try:
+                self.upstream.close()
+            except Exception:
+                pass
+        if self.session is not None:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+        self.cv.notify_all()
+
+    def bind(self, ticket, session=None, upstream=None):
+        with self.cv:
+            if self.ticket != ticket:
+                return
+            if session is not None:
+                self.session = session
+            if upstream is not None:
+                self.upstream = upstream
+
+    def throw_if_cancelled(self, ticket):
+        with self.cv:
+            if self.ticket != ticket or self.cancelled:
+                raise Preempted()
+
+    def release(self, ticket):
+        with self.cv:
+            if self.ticket != ticket:
+                return
+            if self.holder == "high":
+                self.demo_until = time.time() + self.lease_sec
+            self.holder = None
+            self.cancelled = False
+            self.session = None
+            self.upstream = None
+            self.cv.notify_all()
+
+
+SLOT = GpuSlot()
+
+
+def _busy_response(cls):
+    if cls == "high":
+        msg = "Model is busy with another high-priority request"
+        status = 503
+    else:
+        msg = "High-priority client holds the model"
+        status = 429
+    body = json.dumps(
+        {"error": {"message": msg, "type": "unavailable", "code": "gpu_busy"}}
+    )
+    return Response(
+        body,
+        status=status,
+        content_type="application/json",
+        headers={"Retry-After": "15"},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +398,14 @@ SSE_COUNTABLE_PATHS = {"v1/chat/completions", "v1/completions"}
 # --------------------------------------------------------------------------
 # Core proxy route
 # --------------------------------------------------------------------------
+def _client_class():
+    return classify_client(
+        request.remote_addr,
+        request.headers.get("Authorization", ""),
+        request.headers.get("X-Llamagate-Class", ""),
+    )
+
+
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def proxy(path):
     url = f"{OLLAMA_UPSTREAM}/{path}"
@@ -226,29 +414,94 @@ def proxy(path):
     if clean_path in SSE_COUNTABLE_PATHS and request.method == "POST":
         raw_body = _ensure_stream_usage(raw_body)
 
-    upstream_resp = requests.request(
-        method=request.method,
-        url=url,
-        headers={
-            k: v
-            for k, v in request.headers
-            if k.lower() not in ("host", "content-length")
-        },
-        data=raw_body,
-        params=request.args,
-        stream=True,
-        timeout=UPSTREAM_TIMEOUT,
-    )
+    gated = clean_path in GPU_PATHS and request.method == "POST"
+    cls = _client_class() if gated else None
+    ticket = None
+    session = None
+    if gated:
+        wait = DEMO_WAIT_SEC if cls == "high" else BULK_WAIT_SEC
+        ticket = SLOT.acquire(cls, wait)
+        if ticket is None:
+            return _busy_response(cls)
+        session = requests.Session()
+        SLOT.bind(ticket, session=session)
+
+    try:
+        if session is not None:
+            SLOT.throw_if_cancelled(ticket)
+            upstream_resp = session.request(
+                method=request.method,
+                url=url,
+                headers={
+                    k: v
+                    for k, v in request.headers
+                    if k.lower() not in ("host", "content-length")
+                },
+                data=raw_body,
+                params=request.args,
+                stream=True,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+            SLOT.bind(ticket, upstream=upstream_resp)
+            SLOT.throw_if_cancelled(ticket)
+        else:
+            upstream_resp = requests.request(
+                method=request.method,
+                url=url,
+                headers={
+                    k: v
+                    for k, v in request.headers
+                    if k.lower() not in ("host", "content-length")
+                },
+                data=raw_body,
+                params=request.args,
+                stream=True,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+    except Preempted:
+        if ticket is not None:
+            SLOT.release(ticket)
+        if session is not None:
+            session.close()
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "Preempted by a high-priority client",
+                    "type": "unavailable",
+                    "code": "preempted",
+                }
+            }
+        )
+        return Response(body, status=499, content_type="application/json")
+    except Exception:
+        if ticket is not None:
+            SLOT.release(ticket)
+        if session is not None:
+            session.close()
+        raise
+
+    def _finish():
+        if ticket is not None:
+            SLOT.release(ticket)
+        if session is not None:
+            session.close()
 
     if clean_path in NDJSON_COUNTABLE_PATHS:
         def generate():
             total = 0
-            for line in upstream_resp.iter_lines():
-                if line:
-                    total += _extract_tokens_from_ndjson_line(line)
-                    yield line + b"\n"
-            if total > 0:
-                _add_tokens(total)
+            try:
+                for line in upstream_resp.iter_lines():
+                    if ticket is not None:
+                        SLOT.throw_if_cancelled(ticket)
+                    if line:
+                        total += _extract_tokens_from_ndjson_line(line)
+                        yield line + b"\n"
+                if total > 0:
+                    _add_tokens(total)
+            except Preempted:
+                return
+            finally:
+                _finish()
 
     elif clean_path in SSE_COUNTABLE_PATHS:
         def generate():
@@ -256,16 +509,23 @@ def proxy(path):
             # usage object split across 1 KiB chunks, or repeated on
             # every frame, is not added over and over.
             buf = bytearray()
-            for chunk in upstream_resp.iter_content(chunk_size=1024):
-                if chunk:
-                    buf.extend(chunk)
-                    yield chunk
-            body = bytes(buf)
-            total = _extract_tokens_from_sse_chunk(body)
-            if total <= 0:
-                total = _extract_tokens_from_openai_json(body)
-            if total > 0:
-                _add_tokens(total)
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=1024):
+                    if ticket is not None:
+                        SLOT.throw_if_cancelled(ticket)
+                    if chunk:
+                        buf.extend(chunk)
+                        yield chunk
+                body = bytes(buf)
+                total = _extract_tokens_from_sse_chunk(body)
+                if total <= 0:
+                    total = _extract_tokens_from_openai_json(body)
+                if total > 0:
+                    _add_tokens(total)
+            except Preempted:
+                return
+            finally:
+                _finish()
 
     else:
         # Raw passthrough. Deliberately does NOT use iter_lines() here -
@@ -274,9 +534,12 @@ def proxy(path):
         # not noise). Any path we don't explicitly count still needs to
         # be forwarded byte-for-byte intact.
         def generate():
-            for chunk in upstream_resp.iter_content(chunk_size=1024):
-                if chunk:
-                    yield chunk
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                _finish()
 
     return Response(
         stream_with_context(generate()),
@@ -296,6 +559,14 @@ def health():
 @app.route("/proxy/stats")
 def stats():
     return get_token_counts()
+
+
+@app.route("/proxy/slot")
+def slot_status():
+    """Who holds the generation slot. No client identities or keys."""
+    snap = SLOT.snapshot()
+    snap["ok"] = True
+    return snap
 
 
 def _gpu_telemetry():

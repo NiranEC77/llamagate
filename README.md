@@ -134,6 +134,11 @@ All configuration is via environment variables — no config file to edit.
 | `PROXY_PORT` | `11434` | Port llamagate listens on |
 | `LLAMAGATE_COUNTS_FILE` | `<project dir>/token_counts.json` | Where token counts are persisted |
 | `LLAMAGATE_UPSTREAM_TIMEOUT` | `300` | Seconds to wait on a single upstream request |
+| `LLAMAGATE_DEMO_CIDRS` | `172.16.0.0/16` | Source networks treated as high-priority (comma-separated) |
+| `LLAMAGATE_DEMO_KEYS` | `ollama` | Bearer tokens treated as high-priority (comma-separated) |
+| `LLAMAGATE_DEMO_LEASE_SEC` | `90` | Seconds bulk clients wait after a high-priority call so a tool-then-speak turn can finish |
+| `LLAMAGATE_BULK_WAIT_SEC` | `180` | How long a bulk client waits for the slot before `429` |
+| `LLAMAGATE_DEMO_WAIT_SEC` | `30` | How long a high-priority client waits for another high-priority call |
 
 ## Quick start (development)
 
@@ -204,8 +209,28 @@ These are served directly by llamagate, not forwarded to Ollama:
 
 - `GET /proxy/health` → `{"ok": true, "upstream": "<configured upstream URL>"}`
 - `GET /proxy/stats` → `{"tokens_today": <int>, "tokens_total": <int>}`
+- `GET /proxy/slot` → `{"ok": true, "holder": null\|"high"\|"bulk", "demo_lease_remaining_sec": <float>, "preempts": <int>}`
 
 Any other path is forwarded to Ollama as-is.
+
+## Priority (one GPU slot)
+
+Ollama here serves one generation at a time. Chat UIs and background
+agents share that slot. A long agent prompt will starve an interactive
+talk if both are treated equally.
+
+Llamagate therefore has two classes on the chat/generate paths only
+(`/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`):
+
+| Class | How a request qualifies | When the slot is busy |
+|---|---|---|
+| **high** | Source IP in `LLAMAGATE_DEMO_CIDRS`, or `Authorization: Bearer` matches `LLAMAGATE_DEMO_KEYS`, or header `X-Llamagate-Class: demo` | Preempts an in-flight **bulk** call (closes the upstream connection) and takes the slot. After it finishes, a short lease keeps bulk out so a tool-then-speak turn can complete. |
+| **bulk** | Everyone else (agents, scripts, other UIs) | Waits, then `429` with `code=gpu_busy` if the wait expires. A preempted bulk call sees `499` / `code=preempted`. |
+
+`GET /v1/models`, `/api/ps`, and other non-generate paths are not gated.
+
+Still one gunicorn worker. Priority uses the same in-process lock as
+the token counter.
 
 ## Known limitations
 
@@ -221,8 +246,9 @@ Any other path is forwarded to Ollama as-is.
   personal/small-team usage. It's not designed for high-throughput
   multi-tenant scenarios — that would need a real database, which is a
   natural evolution as the observability/security roadmap above develops.
-- No authentication or access control yet — that's explicitly on the
-  roadmap, not a current feature.
+- Priority is two classes, not a full auth system. Anyone who can
+  present a configured high-priority key or sit on a configured CIDR
+  is high. Tighten the key if that dummy value is shared too widely.
 
 ## Adding a new feature
 
