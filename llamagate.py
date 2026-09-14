@@ -242,18 +242,42 @@ def _busy_response(cls):
 # --------------------------------------------------------------------------
 # Token counting - persisted state
 # --------------------------------------------------------------------------
+# One request = one add. tokens_today is prompt + completion. Split fields
+# tell the Captain whether the number is seat-file context or answers.
+_TODAY_KEYS = (
+    "tokens_today",
+    "prompt_tokens_today",
+    "completion_tokens_today",
+    "requests_today",
+    "high_tokens_today",
+    "bulk_tokens_today",
+    "uncounted_requests_today",
+)
+
+
+def _empty_today():
+    return {k: 0 for k in _TODAY_KEYS}
+
+
 def _load_counts():
+    blank = {
+        "date": str(date.today()),
+        "tokens_total": 0,
+        "prompt_tokens_total": 0,
+        "completion_tokens_total": 0,
+        **_empty_today(),
+    }
     if not os.path.exists(COUNTS_FILE):
-        return {"date": str(date.today()), "tokens_today": 0, "tokens_total": 0}
+        return blank
     try:
         with open(COUNTS_FILE) as f:
             data = json.load(f)
     except Exception:
-        return {"date": str(date.today()), "tokens_today": 0, "tokens_total": 0}
+        return blank
 
     if data.get("date") != str(date.today()):
         data["date"] = str(date.today())
-        data["tokens_today"] = 0
+        data.update(_empty_today())
     return data
 
 
@@ -262,13 +286,54 @@ def _save_counts(data):
         json.dump(data, f)
 
 
-def _add_tokens(n):
+def _add_usage(pair, cls=None):
+    """Count one finished request. pair is (prompt_tokens, completion_tokens)."""
+    try:
+        pt = int(pair[0] or 0)
+        ct = int(pair[1] or 0)
+    except (TypeError, ValueError, IndexError):
+        return
+    n = pt + ct
     if n <= 0:
         return
     with _lock:
         data = _load_counts()
-        data["tokens_today"] += n
-        data["tokens_total"] += n
+        data["tokens_today"] = int(data.get("tokens_today") or 0) + n
+        data["tokens_total"] = int(data.get("tokens_total") or 0) + n
+        data["prompt_tokens_today"] = int(data.get("prompt_tokens_today") or 0) + pt
+        data["completion_tokens_today"] = int(data.get("completion_tokens_today") or 0) + ct
+        data["prompt_tokens_total"] = int(data.get("prompt_tokens_total") or 0) + pt
+        data["completion_tokens_total"] = int(data.get("completion_tokens_total") or 0) + ct
+        data["requests_today"] = int(data.get("requests_today") or 0) + 1
+        if cls == "high":
+            data["high_tokens_today"] = int(data.get("high_tokens_today") or 0) + n
+        elif cls == "bulk":
+            data["bulk_tokens_today"] = int(data.get("bulk_tokens_today") or 0) + n
+        _save_counts(data)
+
+
+def _add_tokens(n):
+    """Back-compat: unknown split. Adds to the wire total only."""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return
+    if n <= 0:
+        return
+    with _lock:
+        data = _load_counts()
+        data["tokens_today"] = int(data.get("tokens_today") or 0) + n
+        data["tokens_total"] = int(data.get("tokens_total") or 0) + n
+        data["requests_today"] = int(data.get("requests_today") or 0) + 1
+        _save_counts(data)
+
+
+def _add_uncounted():
+    """A generate/embed request finished with no usage object."""
+    with _lock:
+        data = _load_counts()
+        data["uncounted_requests_today"] = int(data.get("uncounted_requests_today") or 0) + 1
+        data["requests_today"] = int(data.get("requests_today") or 0) + 1
         _save_counts(data)
 
 
@@ -276,7 +341,19 @@ def get_token_counts():
     """Public helper - importable by other services (e.g. a stats/dashboard
     process) that want to read counts without going through HTTP."""
     data = _load_counts()
-    return {"tokens_today": data["tokens_today"], "tokens_total": data["tokens_total"]}
+    return {
+        "tokens_today": int(data.get("tokens_today") or 0),
+        "tokens_total": int(data.get("tokens_total") or 0),
+        "prompt_tokens_today": int(data.get("prompt_tokens_today") or 0),
+        "completion_tokens_today": int(data.get("completion_tokens_today") or 0),
+        "prompt_tokens_total": int(data.get("prompt_tokens_total") or 0),
+        "completion_tokens_total": int(data.get("completion_tokens_total") or 0),
+        "requests_today": int(data.get("requests_today") or 0),
+        "high_tokens_today": int(data.get("high_tokens_today") or 0),
+        "bulk_tokens_today": int(data.get("bulk_tokens_today") or 0),
+        "uncounted_requests_today": int(data.get("uncounted_requests_today") or 0),
+        "date": data.get("date"),
+    }
 
 
 def _tokens_per_sec(tokens_total):
@@ -306,19 +383,36 @@ def _tokens_per_sec(tokens_total):
 # --------------------------------------------------------------------------
 # Response parsers for the two streaming formats Ollama-compatible clients use
 # --------------------------------------------------------------------------
-def _extract_tokens_from_ndjson_line(line):
-    """Ollama's native API (/api/generate, /api/chat) streams newline-
-    delimited JSON. The final chunk (done: true) carries token counts."""
+def _usage_pair(usage):
+    if not isinstance(usage, dict):
+        return (0, 0)
+    return (
+        int(usage.get("prompt_tokens", 0) or 0),
+        int(usage.get("completion_tokens", 0) or 0),
+    )
+
+
+def _extract_usage_from_ndjson_line(line):
+    """Ollama native stream. Only the done:true chunk carries counts."""
     try:
         obj = json.loads(line)
     except Exception:
-        return 0
-    if not obj.get("done"):
-        return 0
-    return obj.get("eval_count", 0) + obj.get("prompt_eval_count", 0)
+        return (0, 0)
+    if not isinstance(obj, dict) or not obj.get("done"):
+        return (0, 0)
+    pt = int(obj.get("prompt_eval_count", 0) or 0)
+    ct = int(obj.get("eval_count", 0) or 0)
+    return (pt, ct)
 
 
-def _extract_tokens_from_sse_chunk(chunk_bytes):
+def _extract_tokens_from_ndjson_line(line):
+    """Ollama's native API (/api/generate, /api/chat) streams newline-
+    delimited JSON. The final chunk (done: true) carries token counts."""
+    pt, ct = _extract_usage_from_ndjson_line(line)
+    return pt + ct
+
+
+def _extract_usage_from_sse_chunk(chunk_bytes):
     """OpenAI-compatible SSE. Count usage once — the last usage object.
 
     Some servers (and our own include_usage injection) repeat a running
@@ -329,8 +423,8 @@ def _extract_tokens_from_sse_chunk(chunk_bytes):
     try:
         text = chunk_bytes.decode("utf-8", errors="ignore")
     except Exception:
-        return 0
-    last = 0
+        return (0, 0)
+    last = (0, 0)
     for line in text.split("\n"):
         line = line.strip()
         if not line.startswith("data:"):
@@ -342,13 +436,31 @@ def _extract_tokens_from_sse_chunk(chunk_bytes):
             obj = json.loads(payload)
         except Exception:
             continue
-        usage = obj.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        last = int(usage.get("prompt_tokens", 0) or 0) + int(
-            usage.get("completion_tokens", 0) or 0
-        )
+        pair = _usage_pair(obj.get("usage"))
+        if pair[0] or pair[1]:
+            last = pair
     return last
+
+
+def _extract_tokens_from_sse_chunk(chunk_bytes):
+    pt, ct = _extract_usage_from_sse_chunk(chunk_bytes)
+    return pt + ct
+
+
+def _extract_usage_from_openai_json(body_bytes):
+    """Non-streaming OpenAI JSON body: top-level ``usage`` object."""
+    try:
+        obj = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+    except Exception:
+        return (0, 0)
+    if not isinstance(obj, dict):
+        return (0, 0)
+    pair = _usage_pair(obj.get("usage"))
+    if pair[0] or pair[1]:
+        return pair
+    pt = int(obj.get("prompt_eval_count", 0) or 0)
+    ct = int(obj.get("eval_count", 0) or 0)
+    return (pt, ct)
 
 
 def _extract_tokens_from_openai_json(body_bytes):
@@ -359,18 +471,23 @@ def _extract_tokens_from_openai_json(body_bytes):
     without this path the public counter freezes while GPU telemetry stays
     live — exactly the 2026-08-17 niran.ai widget failure.
     """
+    pt, ct = _extract_usage_from_openai_json(body_bytes)
+    return pt + ct
+
+
+def _extract_usage_from_embed_json(body_bytes):
+    """Ollama / OpenAI embeddings. Prompt tokens only when the body says."""
     try:
         obj = json.loads(body_bytes.decode("utf-8", errors="ignore"))
     except Exception:
-        return 0
+        return (0, 0)
     if not isinstance(obj, dict):
-        return 0
-    usage = obj.get("usage") or {}
-    if not isinstance(usage, dict):
-        return 0
-    return int(usage.get("prompt_tokens", 0) or 0) + int(
-        usage.get("completion_tokens", 0) or 0
-    )
+        return (0, 0)
+    pair = _usage_pair(obj.get("usage"))
+    if pair[0] or pair[1]:
+        return pair
+    pt = int(obj.get("prompt_eval_count", 0) or 0)
+    return (pt, 0)
 
 
 def _ensure_stream_usage(raw_body: bytes) -> bytes:
@@ -405,6 +522,7 @@ def _ensure_stream_usage(raw_body: bytes) -> bytes:
 # --------------------------------------------------------------------------
 NDJSON_COUNTABLE_PATHS = {"api/generate", "api/chat"}
 SSE_COUNTABLE_PATHS = {"v1/chat/completions", "v1/completions"}
+EMBED_COUNTABLE_PATHS = {"api/embeddings", "api/embed", "v1/embeddings"}
 
 
 # --------------------------------------------------------------------------
@@ -498,18 +616,24 @@ def proxy(path):
         if session is not None:
             session.close()
 
+    count_cls = cls
+
     if clean_path in NDJSON_COUNTABLE_PATHS:
         def generate():
-            total = 0
+            last = (0, 0)
             try:
                 for line in upstream_resp.iter_lines():
                     if ticket is not None:
                         SLOT.throw_if_cancelled(ticket)
                     if line:
-                        total += _extract_tokens_from_ndjson_line(line)
+                        pair = _extract_usage_from_ndjson_line(line)
+                        if pair[0] or pair[1]:
+                            last = pair
                         yield line + b"\n"
-                if total > 0:
-                    _add_tokens(total)
+                if last[0] or last[1]:
+                    _add_usage(last, count_cls)
+                elif request.method == "POST":
+                    _add_uncounted()
             except Preempted:
                 return
             finally:
@@ -529,13 +653,31 @@ def proxy(path):
                         buf.extend(chunk)
                         yield chunk
                 body = bytes(buf)
-                total = _extract_tokens_from_sse_chunk(body)
-                if total <= 0:
-                    total = _extract_tokens_from_openai_json(body)
-                if total > 0:
-                    _add_tokens(total)
+                pair = _extract_usage_from_sse_chunk(body)
+                if pair[0] + pair[1] <= 0:
+                    pair = _extract_usage_from_openai_json(body)
+                if pair[0] or pair[1]:
+                    _add_usage(pair, count_cls)
+                elif request.method == "POST":
+                    _add_uncounted()
             except Preempted:
                 return
+            finally:
+                _finish()
+
+    elif clean_path in EMBED_COUNTABLE_PATHS:
+        def generate():
+            buf = bytearray()
+            try:
+                for chunk in upstream_resp.iter_content(chunk_size=1024):
+                    if chunk:
+                        buf.extend(chunk)
+                        yield chunk
+                pair = _extract_usage_from_embed_json(bytes(buf))
+                if pair[0] or pair[1]:
+                    _add_usage(pair, count_cls)
+                elif request.method == "POST":
+                    _add_uncounted()
             finally:
                 _finish()
 
@@ -639,6 +781,14 @@ def api_stats():
         "loaded_models": _loaded_models(),
         "tokens_today": counts["tokens_today"],
         "tokens_total": counts["tokens_total"],
+        "prompt_tokens_today": counts["prompt_tokens_today"],
+        "completion_tokens_today": counts["completion_tokens_today"],
+        "prompt_tokens_total": counts["prompt_tokens_total"],
+        "completion_tokens_total": counts["completion_tokens_total"],
+        "requests_today": counts["requests_today"],
+        "high_tokens_today": counts["high_tokens_today"],
+        "bulk_tokens_today": counts["bulk_tokens_today"],
+        "uncounted_requests_today": counts["uncounted_requests_today"],
         "tokens_per_sec": _tokens_per_sec(counts["tokens_total"]),
         "updated_at": int(time.time()),
     }

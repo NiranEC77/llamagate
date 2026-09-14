@@ -208,7 +208,7 @@ sudo systemctl enable --now llamagate
 These are served directly by llamagate, not forwarded to Ollama:
 
 - `GET /proxy/health` → `{"ok": true, "upstream": "<configured upstream URL>"}`
-- `GET /proxy/stats` → `{"tokens_today": <int>, "tokens_total": <int>}`
+- `GET /proxy/stats` → wire counts for today and all-time, plus the split: `prompt_tokens_today`, `completion_tokens_today`, `requests_today`, `high_tokens_today`, `bulk_tokens_today`. `tokens_today` is prompt + completion. One finished request is added once.
 - `GET /proxy/slot` → `{"ok": true, "holder": null\|"high"\|"bulk", "demo_lease_remaining_sec": <float>, "preempts": <int>}`
 
 Any other path is forwarded to Ollama as-is.
@@ -234,9 +234,12 @@ the token counter.
 
 ## Known limitations
 
-- Token counting only works for the path patterns listed above. A client
-  using a different endpoint (e.g. `/api/embeddings`) is forwarded correctly
-  but not counted.
+- Token counting covers chat/generate (`/api/chat`, `/api/generate`,
+  `/v1/chat/completions`, `/v1/completions`) and embeddings
+  (`/api/embeddings`, `/api/embed`, `/v1/embeddings`). Other paths are
+  forwarded unchanged and not counted. A finished request with no usage
+  object increments `uncounted_requests_today` instead of inventing a
+  token number.
 - SSE usage data (`/v1/...` paths) is only present if the upstream/client
   combination actually includes a `usage` field in the stream — not every
   client requests this, and not every backend includes it by default. If
