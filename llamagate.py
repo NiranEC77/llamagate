@@ -50,7 +50,10 @@ DEMO_CIDRS_RAW = os.environ.get("LLAMAGATE_DEMO_CIDRS", "172.16.0.0/16")
 DEMO_KEYS_RAW = os.environ.get("LLAMAGATE_DEMO_KEYS", "ollama")
 DEMO_LEASE_SEC = int(os.environ.get("LLAMAGATE_DEMO_LEASE_SEC", "90"))
 BULK_WAIT_SEC = int(os.environ.get("LLAMAGATE_BULK_WAIT_SEC", "180"))
-DEMO_WAIT_SEC = int(os.environ.get("LLAMAGATE_DEMO_WAIT_SEC", "30"))
+# Talk turns queue behind each other. 30s was too short: kicking off a
+# 29k Paperclip prompt can take longer than that, and Agent Builder
+# then showed 503 "high-priority" which is not a Grant revoke.
+DEMO_WAIT_SEC = int(os.environ.get("LLAMAGATE_DEMO_WAIT_SEC", "180"))
 
 _lock = threading.Lock()
 GPU_PATHS = {
@@ -210,13 +213,21 @@ class GpuSlot:
 SLOT = GpuSlot()
 
 
-def _busy_response(cls):
+def _busy_message(cls, holder=None):
+    """Ordinary words for the talk UI. Not a Grant. Not IAM."""
     if cls == "high":
-        msg = "Model is busy with another high-priority request"
-        status = 503
-    else:
-        msg = "High-priority client holds the model"
-        status = 429
+        if holder == "bulk":
+            return "The model is still finishing a background job. Ask again in a few seconds."
+        if holder == "high":
+            return "The model is still answering the last talk turn. Ask again in a few seconds."
+        return "The model is finishing another request. Ask again in a few seconds."
+    return "The model is reserved for a live talk. Retry shortly."
+
+
+def _busy_response(cls):
+    holder = SLOT.snapshot().get("holder")
+    msg = _busy_message(cls, holder)
+    status = 503 if cls == "high" else 429
     body = json.dumps(
         {"error": {"message": msg, "type": "unavailable", "code": "gpu_busy"}}
     )

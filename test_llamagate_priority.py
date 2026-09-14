@@ -88,6 +88,15 @@ def test_high_preempts_bulk():
     slot.release(high_ticket[0])
 
 
+def test_busy_message_is_not_grant_jargon():
+    for holder in ("bulk", "high", None):
+        msg = lg._busy_message("high", holder)
+        assert "high-priority" not in msg.lower()
+        assert "grant" not in msg.lower()
+        assert "denied" not in msg.lower()
+    assert "background job" in lg._busy_message("high", "bulk")
+
+
 def test_high_lease_blocks_bulk():
     slot = lg.GpuSlot(lease_sec=1)
     t_high = slot.acquire("high", 1)
@@ -103,5 +112,6 @@ if __name__ == "__main__":
     test_classify_nest_and_key_are_high()
     test_bulk_waits_for_high_then_runs()
     test_high_preempts_bulk()
+    test_busy_message_is_not_grant_jargon()
     test_high_lease_blocks_bulk()
     print("OK")

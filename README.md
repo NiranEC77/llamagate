@@ -138,7 +138,7 @@ All configuration is via environment variables — no config file to edit.
 | `LLAMAGATE_DEMO_KEYS` | `ollama` | Bearer tokens treated as high-priority (comma-separated) |
 | `LLAMAGATE_DEMO_LEASE_SEC` | `90` | Seconds bulk clients wait after a high-priority call so a tool-then-speak turn can finish |
 | `LLAMAGATE_BULK_WAIT_SEC` | `180` | How long a bulk client waits for the slot before `429` |
-| `LLAMAGATE_DEMO_WAIT_SEC` | `30` | How long a high-priority client waits for another high-priority call |
+| `LLAMAGATE_DEMO_WAIT_SEC` | `180` | How long a high-priority client waits for the slot (including after kicking off a bulk job) |
 
 ## Quick start (development)
 
