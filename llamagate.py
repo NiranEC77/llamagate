@@ -144,7 +144,8 @@ class GpuSlot:
                 now = time.time()
                 if cls == "high":
                     if self.holder == "bulk":
-                        self._cancel_locked()
+                        if not self.cancelled:
+                            self._cancel_locked()
                     elif self.holder is None:
                         return self._take_locked("high")
                 elif self.holder is None and now >= self.demo_until:

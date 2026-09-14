@@ -84,7 +84,7 @@ def test_high_preempts_bulk():
     th.join(timeout=2)
     assert high_ticket and high_ticket[0] is not None
     snap = slot.snapshot()
-    assert snap["preempts"] >= 1
+    assert snap["preempts"] == 1
     slot.release(high_ticket[0])
 
 
