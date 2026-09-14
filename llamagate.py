@@ -26,6 +26,7 @@ import ipaddress
 import requests
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -110,6 +111,72 @@ def classify_client(remote_addr, authorization="", class_header=""):
         if ip in net:
             return "high"
     return "bulk"
+
+
+# Who spent the tokens. Header first, then a known actor key, then
+# the high/bulk class. Never store raw IPs or bearer values.
+ACTOR_SLUG = re.compile(r"[^a-z0-9-]+")
+DEFAULT_ACTOR_KEYS = {
+    "actor-it-hermes": "it-hermes",
+    "actor-marketing-hermes": "marketing-hermes",
+    "actor-security-hermes": "security-hermes",
+    "actor-brain": "brain",
+    "actor-command-box": "command-box",
+}
+ACTOR_NAMES = {
+    "it-hermes": "IT",
+    "marketing-hermes": "Marketing",
+    "security-hermes": "Security",
+    "talk": "Tanzu talk",
+    "brain": "Company brain",
+    "command-box": "Command box",
+    "other": "Other",
+    "unattributed": "Before names",
+}
+
+
+def _actor_slug(raw):
+    s = ACTOR_SLUG.sub("-", (raw or "").strip().lower()).strip("-")
+    return s[:40]
+
+
+def _parse_actor_keys(raw):
+    out = dict(DEFAULT_ACTOR_KEYS)
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        key, slug = part.split(":", 1)
+        key = key.strip()
+        slug = _actor_slug(slug)
+        if key and slug:
+            out[key] = slug
+    return out
+
+
+ACTOR_KEYS = _parse_actor_keys(os.environ.get("LLAMAGATE_ACTOR_KEYS", ""))
+
+
+def classify_actor(
+    remote_addr,
+    authorization="",
+    actor_header="",
+    user_agent="",
+    class_header="",
+):
+    """Name the caller. Product path: X-Llamagate-Actor or a known actor key."""
+    header = _actor_slug(actor_header)
+    if header and header not in {"unattributed"}:
+        return header
+    token = _bearer_token(authorization)
+    if token and token in ACTOR_KEYS:
+        return ACTOR_KEYS[token]
+    ua = (user_agent or "").lower()
+    if "insightout-brain-dgx" in ua:
+        return "brain"
+    if classify_client(remote_addr, authorization, class_header) == "high":
+        return "talk"
+    return "other"
 
 
 class Preempted(Exception):
@@ -278,6 +345,7 @@ def _load_counts():
     if data.get("date") != str(date.today()):
         data["date"] = str(date.today())
         data.update(_empty_today())
+        data["actors_today"] = {}
     return data
 
 
@@ -286,7 +354,38 @@ def _save_counts(data):
         json.dump(data, f)
 
 
-def _add_usage(pair, cls=None):
+def _bump_actor(actors, slug, pt, ct, cls):
+    if not isinstance(actors, dict):
+        actors = {}
+    row = actors.get(slug) if isinstance(actors.get(slug), dict) else {}
+    actors[slug] = {
+        "prompt": int(row.get("prompt") or 0) + pt,
+        "completion": int(row.get("completion") or 0) + ct,
+        "requests": int(row.get("requests") or 0) + 1,
+        "class": cls or row.get("class") or "",
+    }
+    if len(actors) <= 40:
+        return actors
+    ranked = sorted(
+        actors.items(),
+        key=lambda kv: int(kv[1].get("prompt") or 0) + int(kv[1].get("completion") or 0),
+    )
+    while len(actors) > 40 and ranked:
+        drop_id, drop = ranked.pop(0)
+        if drop_id == "other":
+            continue
+        actors.pop(drop_id, None)
+        other = actors.get("other") if isinstance(actors.get("other"), dict) else {}
+        actors["other"] = {
+            "prompt": int(other.get("prompt") or 0) + int(drop.get("prompt") or 0),
+            "completion": int(other.get("completion") or 0) + int(drop.get("completion") or 0),
+            "requests": int(other.get("requests") or 0) + int(drop.get("requests") or 0),
+            "class": "bulk",
+        }
+    return actors
+
+
+def _add_usage(pair, cls=None, actor=None):
     """Count one finished request. pair is (prompt_tokens, completion_tokens)."""
     try:
         pt = int(pair[0] or 0)
@@ -296,6 +395,9 @@ def _add_usage(pair, cls=None):
     n = pt + ct
     if n <= 0:
         return
+    slug = _actor_slug(actor) if actor else ""
+    if not slug:
+        slug = "talk" if cls == "high" else "other"
     with _lock:
         data = _load_counts()
         data["tokens_today"] = int(data.get("tokens_today") or 0) + n
@@ -309,6 +411,7 @@ def _add_usage(pair, cls=None):
             data["high_tokens_today"] = int(data.get("high_tokens_today") or 0) + n
         elif cls == "bulk":
             data["bulk_tokens_today"] = int(data.get("bulk_tokens_today") or 0) + n
+        data["actors_today"] = _bump_actor(data.get("actors_today"), slug, pt, ct, cls)
         _save_counts(data)
 
 
@@ -353,7 +456,51 @@ def get_token_counts():
         "bulk_tokens_today": int(data.get("bulk_tokens_today") or 0),
         "uncounted_requests_today": int(data.get("uncounted_requests_today") or 0),
         "date": data.get("date"),
+        "actors": _actors_view(data),
     }
+
+
+def _actors_view(data):
+    """Named callers for today. leftover is today minus named rows."""
+    today = int(data.get("tokens_today") or 0)
+    raw = data.get("actors_today")
+    rows = []
+    named = 0
+    if isinstance(raw, dict):
+        for slug, row in raw.items():
+            if not isinstance(row, dict):
+                continue
+            sid = _actor_slug(slug) or "other"
+            pt = int(row.get("prompt") or 0)
+            ct = int(row.get("completion") or 0)
+            n = pt + ct
+            named += n
+            rows.append(
+                {
+                    "id": sid,
+                    "name": ACTOR_NAMES.get(sid, sid.replace("-", " ")),
+                    "prompt_tokens": pt,
+                    "completion_tokens": ct,
+                    "tokens": n,
+                    "requests": int(row.get("requests") or 0),
+                    "class": row.get("class") or "",
+                }
+            )
+    rows.sort(key=lambda r: r["tokens"], reverse=True)
+    leftover = max(0, today - named)
+    if leftover:
+        rows.append(
+            {
+                "id": "unattributed",
+                "name": ACTOR_NAMES["unattributed"],
+                "prompt_tokens": leftover,
+                "completion_tokens": 0,
+                "tokens": leftover,
+                "requests": 0,
+                "class": "",
+            }
+        )
+    return rows
 
 
 def _tokens_per_sec(tokens_total):
@@ -536,6 +683,17 @@ def _client_class():
     )
 
 
+def _client_actor():
+    return classify_actor(
+        request.remote_addr,
+        request.headers.get("Authorization", ""),
+        request.headers.get("X-Llamagate-Actor")
+        or request.headers.get("X-Llamagate-Agent"),
+        request.headers.get("User-Agent", ""),
+        request.headers.get("X-Llamagate-Class", ""),
+    )
+
+
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def proxy(path):
     url = f"{OLLAMA_UPSTREAM}/{path}"
@@ -617,6 +775,7 @@ def proxy(path):
             session.close()
 
     count_cls = cls
+    count_actor = _client_actor()
 
     if clean_path in NDJSON_COUNTABLE_PATHS:
         def generate():
@@ -631,7 +790,7 @@ def proxy(path):
                             last = pair
                         yield line + b"\n"
                 if last[0] or last[1]:
-                    _add_usage(last, count_cls)
+                    _add_usage(last, count_cls, count_actor)
                 elif request.method == "POST":
                     _add_uncounted()
             except Preempted:
@@ -657,7 +816,7 @@ def proxy(path):
                 if pair[0] + pair[1] <= 0:
                     pair = _extract_usage_from_openai_json(body)
                 if pair[0] or pair[1]:
-                    _add_usage(pair, count_cls)
+                    _add_usage(pair, count_cls, count_actor)
                 elif request.method == "POST":
                     _add_uncounted()
             except Preempted:
@@ -675,7 +834,7 @@ def proxy(path):
                         yield chunk
                 pair = _extract_usage_from_embed_json(bytes(buf))
                 if pair[0] or pair[1]:
-                    _add_usage(pair, count_cls)
+                    _add_usage(pair, count_cls, count_actor)
                 elif request.method == "POST":
                     _add_uncounted()
             finally:

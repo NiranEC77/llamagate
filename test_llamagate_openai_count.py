@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import types
+from datetime import date
 from pathlib import Path
 
 flask = types.ModuleType("flask")
@@ -125,6 +126,23 @@ def test_embed_usage():
     assert lg._extract_usage_from_embed_json(openai) == (8, 0)
 
 
+def test_classify_actor_header_and_key():
+    assert lg.classify_actor("10.0.0.2", actor_header="IT-hermes") == "it-hermes"
+    assert (
+        lg.classify_actor("10.0.0.2", authorization="Bearer actor-marketing-hermes")
+        == "marketing-hermes"
+    )
+    assert (
+        lg.classify_actor("10.0.0.2", user_agent="insightout-brain-dgx/1") == "brain"
+    )
+    assert lg.classify_actor("172.16.19.60") == "talk"
+    assert lg.classify_actor("10.0.0.2") == "other"
+    assert (
+        lg.classify_actor("10.0.0.2", authorization="Bearer actor-command-box")
+        == "command-box"
+    )
+
+
 def test_add_usage_splits_and_counts_once():
     import tempfile
 
@@ -132,8 +150,8 @@ def test_add_usage_splits_and_counts_once():
     try:
         with tempfile.TemporaryDirectory() as tmp:
             lg.COUNTS_FILE = str(Path(tmp) / "counts.json")
-            lg._add_usage((100, 5), "bulk")
-            lg._add_usage((20, 3), "high")
+            lg._add_usage((100, 5), "bulk", "it-hermes")
+            lg._add_usage((20, 3), "high", "talk")
             counts = lg.get_token_counts()
             assert counts["tokens_today"] == 128
             assert counts["prompt_tokens_today"] == 120
@@ -142,6 +160,35 @@ def test_add_usage_splits_and_counts_once():
             assert counts["high_tokens_today"] == 23
             assert counts["requests_today"] == 2
             assert counts["tokens_total"] == 128
+            names = {row["id"]: row for row in counts["actors"]}
+            assert names["it-hermes"]["tokens"] == 105
+            assert names["it-hermes"]["name"] == "IT"
+            assert names["talk"]["tokens"] == 23
+            leftover_path = Path(tmp) / "leftover.json"
+            leftover_path.write_text(
+                json.dumps(
+                    {
+                        "date": str(date.today()),
+                        "tokens_today": 1000,
+                        "tokens_total": 1000,
+                        "prompt_tokens_today": 900,
+                        "completion_tokens_today": 100,
+                        "actors_today": {
+                            "it-hermes": {
+                                "prompt": 40,
+                                "completion": 5,
+                                "requests": 1,
+                                "class": "bulk",
+                            }
+                        },
+                    }
+                )
+            )
+            lg.COUNTS_FILE = str(leftover_path)
+            leftover = {row["id"]: row for row in lg.get_token_counts()["actors"]}
+            assert leftover["it-hermes"]["tokens"] == 45
+            assert leftover["unattributed"]["name"] == "Before names"
+            assert leftover["unattributed"]["tokens"] == 955
     finally:
         lg.COUNTS_FILE = prev
 
@@ -182,6 +229,7 @@ if __name__ == "__main__":
     test_inject_stream_usage()
     test_inject_noop_when_already_set()
     test_inject_noop_when_not_streaming()
+    test_classify_actor_header_and_key()
     test_sse_usage_split()
     test_ndjson_last_done_wins()
     test_embed_usage()

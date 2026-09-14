@@ -208,7 +208,7 @@ sudo systemctl enable --now llamagate
 These are served directly by llamagate, not forwarded to Ollama:
 
 - `GET /proxy/health` → `{"ok": true, "upstream": "<configured upstream URL>"}`
-- `GET /proxy/stats` → wire counts for today and all-time, plus the split: `prompt_tokens_today`, `completion_tokens_today`, `requests_today`, `high_tokens_today`, `bulk_tokens_today`. `tokens_today` is prompt + completion. One finished request is added once.
+- `GET /proxy/stats` → wire counts for today and all-time, plus the split: `prompt_tokens_today`, `completion_tokens_today`, `requests_today`, `high_tokens_today`, `bulk_tokens_today`, and `actors` (who spent them). `tokens_today` is prompt + completion. One finished request is added once. `/api/stats` stays the public widget shape and does not name company actors.
 - `GET /proxy/slot` → `{"ok": true, "holder": null\|"high"\|"bulk", "demo_lease_remaining_sec": <float>, "preempts": <int>}`
 
 Any other path is forwarded to Ollama as-is.
