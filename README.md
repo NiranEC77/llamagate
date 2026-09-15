@@ -139,6 +139,7 @@ All configuration is via environment variables — no config file to edit.
 | `LLAMAGATE_DEMO_LEASE_SEC` | `90` | Seconds bulk clients wait after a high-priority call so a tool-then-speak turn can finish |
 | `LLAMAGATE_BULK_WAIT_SEC` | `180` | How long a bulk client waits for the slot before `429` |
 | `LLAMAGATE_DEMO_WAIT_SEC` | `180` | How long a high-priority client waits for the slot (including after kicking off a bulk job) |
+| `LLAMAGATE_LOCK_FILE` | next to the counts file | Persists the Captain demo lock across restarts |
 
 ## Quick start (development)
 
@@ -209,7 +210,9 @@ These are served directly by llamagate, not forwarded to Ollama:
 
 - `GET /proxy/health` → `{"ok": true, "upstream": "<configured upstream URL>"}`
 - `GET /proxy/stats` → wire counts for today and all-time, plus the split: `prompt_tokens_today`, `completion_tokens_today`, `requests_today`, `high_tokens_today`, `bulk_tokens_today`, and `actors` (who spent them). `tokens_today` is prompt + completion. One finished request is added once. `/api/stats` stays the public widget shape and does not name company actors.
-- `GET /proxy/slot` → `{"ok": true, "holder": null\|"high"\|"bulk", "demo_lease_remaining_sec": <float>, "preempts": <int>}`
+- `GET /proxy/slot` → `{"ok": true, "busy": <bool>, "holder": null\|"high"\|"bulk", "holder_name": <string\|null>, "waiting": <int>, "waiting_talk": <int>, "waiting_other": <int>, "demo_lease_remaining_sec": <float>, "preempts": <int>, "demo_lock": <bool>}`
+- `GET /proxy/demo-lock` → same slot snapshot
+- `POST /proxy/demo-lock` with `{"on": true}` or `{"on": false}` → Captain kill switch. High-priority only (nest CIDR, demo Bearer, or `X-Llamagate-Class: demo`). Talk stays on. Bulk is refused and an in-flight bulk call is cancelled. Survives a gunicorn restart.
 
 Any other path is forwarded to Ollama as-is.
 
@@ -225,7 +228,7 @@ Llamagate therefore has two classes on the chat/generate paths only
 | Class | How a request qualifies | When the slot is busy |
 |---|---|---|
 | **high** | Source IP in `LLAMAGATE_DEMO_CIDRS`, or `Authorization: Bearer` matches `LLAMAGATE_DEMO_KEYS`, or header `X-Llamagate-Class: demo` | Preempts an in-flight **bulk** call (closes the upstream connection) and takes the slot. After it finishes, a short lease keeps bulk out so a tool-then-speak turn can complete. |
-| **bulk** | Everyone else (agents, scripts, other UIs) | Waits, then `429` with `code=gpu_busy` if the wait expires. A preempted bulk call sees `499` / `code=preempted`. |
+| **bulk** | Everyone else (agents, scripts, other UIs) | Waits, then `429` with `code=gpu_busy` if the wait expires. A preempted bulk call sees `499` / `code=preempted`. If the Captain demo lock is on, bulk is refused immediately. |
 
 `GET /v1/models`, `/api/ps`, and other non-generate paths are not gated.
 

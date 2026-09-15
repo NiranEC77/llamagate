@@ -44,6 +44,10 @@ COUNTS_FILE = os.environ.get(
     "LLAMAGATE_COUNTS_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_counts.json"),
 )
+LOCK_FILE = os.environ.get(
+    "LLAMAGATE_LOCK_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(COUNTS_FILE)), "demo_lock.json"),
+)
 UPSTREAM_TIMEOUT = int(os.environ.get("LLAMAGATE_UPSTREAM_TIMEOUT", "300"))
 # High-priority clients (Tanzu talk / nest) preempt bulk (Paperclip, UIs).
 # One Ollama slot. A bulk 32k prompt otherwise 400s the talk at ~60s.
@@ -187,7 +191,7 @@ class GpuSlot:
     """One generation slot. high preempts bulk. high lease keeps bulk out
     between talk turns so Agent Builder can call a tool and speak."""
 
-    def __init__(self, lease_sec=DEMO_LEASE_SEC):
+    def __init__(self, lease_sec=DEMO_LEASE_SEC, lock_path=None):
         self.cv = threading.Condition()
         self.holder = None
         self.ticket = 0
@@ -197,37 +201,113 @@ class GpuSlot:
         self.demo_until = 0.0
         self.preempts = 0
         self.lease_sec = int(lease_sec)
+        self.lock_path = lock_path
+        self.demo_lock = False
+        self.actor = None
+        self.waiting_high = 0
+        self.waiting_bulk = 0
+        self._load_lock()
 
     def snapshot(self):
         with self.cv:
             remaining = max(0.0, self.demo_until - time.time())
+            actor = self.actor if self.holder else None
+            name = None
+            if self.holder:
+                if actor == "other" or (self.holder == "bulk" and actor in {None, "", "other"}):
+                    name = "Paperclip or other"
+                else:
+                    name = ACTOR_NAMES.get(actor or "", "")
+                    if not name:
+                        name = (actor or "").replace("-", " ") or (
+                            "Tanzu talk" if self.holder == "high" else "Paperclip or other"
+                        )
             return {
                 "holder": self.holder,
+                "holder_actor": actor,
+                "holder_name": name,
+                "busy": self.holder is not None,
+                "waiting": self.waiting_high + self.waiting_bulk,
+                "waiting_talk": self.waiting_high,
+                "waiting_other": self.waiting_bulk,
                 "demo_lease_remaining_sec": round(remaining, 1),
                 "preempts": self.preempts,
+                "demo_lock": bool(self.demo_lock),
             }
 
-    def acquire(self, cls, wait_sec):
-        deadline = time.time() + max(0.0, float(wait_sec))
+    def set_demo_lock(self, on):
+        """Captain kill switch. Bulk cannot take Qwen while this is on."""
         with self.cv:
-            while True:
-                now = time.time()
-                if cls == "high":
-                    if self.holder == "bulk":
-                        if not self.cancelled:
-                            self._cancel_locked()
-                    elif self.holder is None:
-                        return self._take_locked("high")
-                elif self.holder is None and now >= self.demo_until:
-                    return self._take_locked("bulk")
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    return None
-                self.cv.wait(timeout=min(remaining, 0.25))
+            self.demo_lock = bool(on)
+            if self.demo_lock and self.holder == "bulk" and not self.cancelled:
+                self._cancel_locked()
+            self._persist_lock()
+            self.cv.notify_all()
+            return self.demo_lock
 
-    def _take_locked(self, cls):
+    def _load_lock(self):
+        if not self.lock_path:
+            return
+        try:
+            with open(self.lock_path, encoding="utf-8") as fh:
+                data = json.loads(fh.read() or "{}")
+            self.demo_lock = bool(data.get("on"))
+        except (OSError, ValueError, TypeError):
+            self.demo_lock = False
+
+    def _persist_lock(self):
+        if not self.lock_path:
+            return
+        try:
+            parent = os.path.dirname(self.lock_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.lock_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"on": bool(self.demo_lock)}) + "\n")
+        except OSError:
+            pass
+
+    def acquire(self, cls, wait_sec, actor=None):
+        deadline = time.time() + max(0.0, float(wait_sec))
+        waiting = False
+        with self.cv:
+            try:
+                while True:
+                    now = time.time()
+                    if cls == "high":
+                        if self.holder == "bulk":
+                            if not self.cancelled:
+                                self._cancel_locked()
+                        elif self.holder is None:
+                            return self._take_locked("high", actor)
+                    elif self.demo_lock:
+                        return None
+                    elif self.holder is None and now >= self.demo_until:
+                        return self._take_locked("bulk", actor)
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return None
+                    if not waiting:
+                        if cls == "high":
+                            self.waiting_high += 1
+                        else:
+                            self.waiting_bulk += 1
+                        waiting = True
+                    self.cv.wait(timeout=min(remaining, 0.25))
+            finally:
+                if waiting:
+                    if cls == "high":
+                        self.waiting_high = max(0, self.waiting_high - 1)
+                    else:
+                        self.waiting_bulk = max(0, self.waiting_bulk - 1)
+
+    def _take_locked(self, cls, actor=None):
         self.ticket += 1
         self.holder = cls
+        slug = _actor_slug(actor) if actor else ""
+        if not slug:
+            slug = "talk" if cls == "high" else "other"
+        self.actor = slug
         self.cancelled = False
         self.session = None
         self.upstream = None
@@ -271,17 +351,20 @@ class GpuSlot:
             if self.holder == "high":
                 self.demo_until = time.time() + self.lease_sec
             self.holder = None
+            self.actor = None
             self.cancelled = False
             self.session = None
             self.upstream = None
             self.cv.notify_all()
 
 
-SLOT = GpuSlot()
+SLOT = GpuSlot(lock_path=LOCK_FILE)
 
 
-def _busy_message(cls, holder=None):
+def _busy_message(cls, holder=None, demo_lock=False):
     """Ordinary words for the talk UI. Not a Grant. Not IAM."""
+    if demo_lock and cls != "high":
+        return "The model is reserved for a live demo."
     if cls == "high":
         if holder == "bulk":
             return "The model is still finishing a background job. Ask again in a few seconds."
@@ -292,8 +375,9 @@ def _busy_message(cls, holder=None):
 
 
 def _busy_response(cls):
-    holder = SLOT.snapshot().get("holder")
-    msg = _busy_message(cls, holder)
+    snap = SLOT.snapshot()
+    holder = snap.get("holder")
+    msg = _busy_message(cls, holder, demo_lock=bool(snap.get("demo_lock")))
     status = 503 if cls == "high" else 429
     body = json.dumps(
         {"error": {"message": msg, "type": "unavailable", "code": "gpu_busy"}}
@@ -708,7 +792,7 @@ def proxy(path):
     session = None
     if gated:
         wait = DEMO_WAIT_SEC if cls == "high" else BULK_WAIT_SEC
-        ticket = SLOT.acquire(cls, wait)
+        ticket = SLOT.acquire(cls, wait, actor=_client_actor())
         if ticket is None:
             return _busy_response(cls)
         session = requests.Session()
@@ -877,6 +961,37 @@ def stats():
 @app.route("/proxy/slot")
 def slot_status():
     """Who holds the generation slot. No client identities or keys."""
+    snap = SLOT.snapshot()
+    snap["ok"] = True
+    return snap
+
+
+@app.route("/proxy/demo-lock", methods=["GET", "POST"])
+def demo_lock():
+    """Captain kill switch. Talk stays on. Bulk (Paperclip, UIs) is refused."""
+    if request.method == "GET":
+        snap = SLOT.snapshot()
+        snap["ok"] = True
+        return snap
+    if _client_class() != "high":
+        return Response(
+            json.dumps({"ok": False, "error": "lock-denied"}),
+            status=403,
+            content_type="application/json",
+        )
+    data = request.get_json(silent=True) or {}
+    raw = data.get("on", request.args.get("on"))
+    if raw is None:
+        return Response(
+            json.dumps({"ok": False, "error": "missing-on"}),
+            status=400,
+            content_type="application/json",
+        )
+    if isinstance(raw, str):
+        on = raw.strip().lower() in {"1", "true", "on", "yes"}
+    else:
+        on = bool(raw)
+    SLOT.set_demo_lock(on)
     snap = SLOT.snapshot()
     snap["ok"] = True
     return snap

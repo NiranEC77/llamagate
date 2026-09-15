@@ -108,10 +108,89 @@ def test_high_lease_blocks_bulk():
     slot.release(t_bulk)
 
 
+def test_demo_lock_refuses_bulk_and_keeps_high():
+    slot = lg.GpuSlot(lease_sec=0)
+    assert slot.set_demo_lock(True) is True
+    assert slot.snapshot()["demo_lock"] is True
+    assert slot.acquire("bulk", 0.2) is None
+    t_high = slot.acquire("high", 1)
+    assert t_high is not None
+    slot.release(t_high)
+    slot.set_demo_lock(False)
+    t_bulk = slot.acquire("bulk", 1)
+    assert t_bulk is not None
+    slot.release(t_bulk)
+
+
+def test_demo_lock_cancels_running_bulk():
+    slot = lg.GpuSlot(lease_sec=0)
+    t_bulk = slot.acquire("bulk", 1)
+    assert t_bulk is not None
+    slot.set_demo_lock(True)
+    try:
+        slot.throw_if_cancelled(t_bulk)
+        raise AssertionError("bulk should have been cancelled")
+    except lg.Preempted:
+        slot.release(t_bulk)
+    assert slot.snapshot()["demo_lock"] is True
+    slot.set_demo_lock(False)
+
+
+def test_busy_message_names_demo_lock():
+    msg = lg._busy_message("bulk", demo_lock=True)
+    assert "demo" in msg.lower()
+    assert "grant" not in msg.lower()
+
+
+def test_waiting_counts_show_queue():
+    slot = lg.GpuSlot(lease_sec=0)
+    t_high = slot.acquire("high", 1, actor="talk")
+    assert t_high is not None
+    snap = slot.snapshot()
+    assert snap["busy"] is True
+    assert snap["holder_name"] == "Tanzu talk"
+    got = []
+
+    def waiter():
+        got.append(slot.acquire("bulk", 2, actor="it-hermes"))
+
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.1)
+    queued = slot.snapshot()
+    assert queued["waiting_other"] == 1
+    assert queued["waiting"] == 1
+    slot.release(t_high)
+    th.join(timeout=2)
+    assert got and got[0] is not None
+    after = slot.snapshot()
+    assert after["holder_name"] == "IT"
+    slot.release(got[0])
+    assert slot.snapshot()["waiting"] == 0
+    assert slot.snapshot()["busy"] is False
+
+
+def test_demo_lock_persists():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "demo_lock.json")
+        slot = lg.GpuSlot(lease_sec=0, lock_path=path)
+        assert slot.set_demo_lock(True) is True
+        again = lg.GpuSlot(lease_sec=0, lock_path=path)
+        assert again.snapshot()["demo_lock"] is True
+
+
 if __name__ == "__main__":
     test_classify_nest_and_key_are_high()
     test_bulk_waits_for_high_then_runs()
     test_high_preempts_bulk()
     test_busy_message_is_not_grant_jargon()
     test_high_lease_blocks_bulk()
+    test_demo_lock_refuses_bulk_and_keeps_high()
+    test_demo_lock_cancels_running_bulk()
+    test_busy_message_names_demo_lock()
+    test_waiting_counts_show_queue()
+    test_demo_lock_persists()
     print("OK")
