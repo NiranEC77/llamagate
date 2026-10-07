@@ -170,6 +170,77 @@ def test_waiting_counts_show_queue():
     assert slot.snapshot()["busy"] is False
 
 
+def test_holder_records_process_start_and_agent():
+    slot = lg.GpuSlot(lease_sec=0)
+    assert slot.snapshot()["holder_since"] is None
+    assert slot.snapshot()["next"] is None
+    t = slot.acquire("bulk", 1, actor="it-hermes", process="chat on gpt-oss:120b")
+    snap = slot.snapshot()
+    assert snap["holder_name"] == "IT"
+    assert snap["holder_process"] == "chat on gpt-oss:120b"
+    assert snap["holder_since"].endswith("Z")
+    assert snap["holder_seconds"] >= 0
+    slot.release(t)
+    after = slot.snapshot()
+    assert after["holder_process"] is None
+    assert after["holder_since"] is None
+
+
+def test_queue_names_next_in_order_and_serves_it():
+    slot = lg.GpuSlot(lease_sec=0)
+    t_hold = slot.acquire("bulk", 1, actor="brain", process="chat on m")
+    got = {}
+
+    def waiter(actor, cls):
+        got[actor] = slot.acquire(cls, 3, actor=actor, process="chat on m")
+        if got[actor] is not None:
+            got.setdefault("order", []).append(actor)
+            time.sleep(0.05)
+            slot.release(got[actor])
+
+    th_sec = threading.Thread(target=waiter, args=("security-hermes", "bulk"))
+    th_sec.start()
+    time.sleep(0.05)
+    th_mkt = threading.Thread(target=waiter, args=("marketing-hermes", "bulk"))
+    th_mkt.start()
+    time.sleep(0.05)
+    snap = slot.snapshot()
+    assert [w["name"] for w in snap["queue"]] == ["Security", "Marketing"]
+    assert snap["next"]["name"] == "Security"
+    assert snap["next"]["process"] == "chat on m"
+    assert snap["next"]["since"].endswith("Z")
+    slot.release(t_hold)
+    th_sec.join(timeout=3)
+    th_mkt.join(timeout=3)
+    assert got["order"] == ["security-hermes", "marketing-hermes"]
+    assert slot.snapshot()["queue"] == []
+
+
+def test_talk_waiter_is_next_ahead_of_earlier_bulk():
+    slot = lg.GpuSlot(lease_sec=0)
+    t_hold = slot.acquire("high", 1, actor="talk")
+    th_bulk = threading.Thread(target=lambda: slot.acquire("bulk", 0.5, actor="it-hermes"))
+    th_bulk.start()
+    time.sleep(0.05)
+    th_high = threading.Thread(target=lambda: slot.acquire("high", 0.5, actor="talk"))
+    th_high.start()
+    time.sleep(0.05)
+    snap = slot.snapshot()
+    assert snap["next"]["name"] == "Tanzu talk"
+    assert [w["class"] for w in snap["queue"]] == ["high", "bulk"]
+    th_bulk.join(timeout=2)
+    th_high.join(timeout=2)
+    slot.release(t_hold)
+
+
+def test_describe_process_reads_model_not_prompt():
+    body = b'{"model": "gpt-oss:120b", "messages": [{"role": "user", "content": "secret"}]}'
+    assert lg.describe_process("v1/chat/completions", body) == "chat on gpt-oss:120b"
+    assert lg.describe_process("api/generate", b'{"model":"qwen3:32b"}') == "generate on qwen3:32b"
+    assert lg.describe_process("api/chat", b"not json") == "chat"
+    assert "secret" not in lg.describe_process("api/chat", body)
+
+
 def test_demo_lock_persists():
     import tempfile
     from pathlib import Path
@@ -192,5 +263,9 @@ if __name__ == "__main__":
     test_demo_lock_cancels_running_bulk()
     test_busy_message_names_demo_lock()
     test_waiting_counts_show_queue()
+    test_holder_records_process_start_and_agent()
+    test_queue_names_next_in_order_and_serves_it()
+    test_talk_waiter_is_next_ahead_of_earlier_bulk()
+    test_describe_process_reads_model_not_prompt()
     test_demo_lock_persists()
     print("OK")

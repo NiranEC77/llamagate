@@ -187,9 +187,54 @@ class Preempted(Exception):
     """Bulk call was cancelled so a high-priority client can run."""
 
 
+GPU_CALL_KIND = {
+    "v1/chat/completions": "chat",
+    "api/chat": "chat",
+    "v1/completions": "completion",
+    "api/generate": "generate",
+}
+MODEL_SAFE = re.compile(r"[^A-Za-z0-9._:/-]+")
+
+
+def describe_process(path, raw_body=b""):
+    """What the caller is running, e.g. "chat on gpt-oss:120b".
+    Reads only the model field. Never the prompt."""
+    kind = GPU_CALL_KIND.get((path or "").strip("/"), (path or "").strip("/") or "call")
+    model = ""
+    try:
+        data = json.loads(raw_body or b"{}")
+        if isinstance(data, dict):
+            model = MODEL_SAFE.sub("", str(data.get("model") or ""))[:60]
+    except (ValueError, TypeError):
+        model = ""
+    return f"{kind} on {model}" if model else kind
+
+
+def _actor_name(cls, actor):
+    if actor == "other" or (cls == "bulk" and actor in {None, "", "other"}):
+        return "Paperclip or other"
+    name = ACTOR_NAMES.get(actor or "", "")
+    if name:
+        return name
+    return (actor or "").replace("-", " ") or (
+        "Tanzu talk" if cls == "high" else "Paperclip or other"
+    )
+
+
+def _utc_iso(epoch):
+    if not epoch:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+_CLASS_RANK = {"high": 0, "bulk": 1}
+
+
 class GpuSlot:
     """One generation slot. high preempts bulk. high lease keeps bulk out
-    between talk turns so Agent Builder can call a tool and speak."""
+    between talk turns so Agent Builder can call a tool and speak.
+    Waiters are served in order: talk first, then arrival time, so the
+    snapshot can name who is next and be right."""
 
     def __init__(self, lease_sec=DEMO_LEASE_SEC, lock_path=None):
         self.cv = threading.Condition()
@@ -204,32 +249,60 @@ class GpuSlot:
         self.lock_path = lock_path
         self.demo_lock = False
         self.actor = None
+        self.holder_since = 0.0
+        self.holder_process = None
         self.waiting_high = 0
         self.waiting_bulk = 0
+        self.queue = []
+        self._seq = 0
         self._load_lock()
+
+    def _line_locked(self):
+        return sorted(self.queue, key=lambda w: (_CLASS_RANK.get(w["cls"], 9), w["seq"]))
+
+    def _someone_ahead_locked(self, cls, entry):
+        rank = _CLASS_RANK.get(cls, 9)
+        seq = entry["seq"] if entry else float("inf")
+        for w in self.queue:
+            if w is entry:
+                continue
+            w_rank = _CLASS_RANK.get(w["cls"], 9)
+            if w_rank < rank or (w_rank == rank and w["seq"] < seq):
+                return True
+        return False
 
     def snapshot(self):
         with self.cv:
-            remaining = max(0.0, self.demo_until - time.time())
+            now = time.time()
+            remaining = max(0.0, self.demo_until - now)
             actor = self.actor if self.holder else None
-            name = None
-            if self.holder:
-                if actor == "other" or (self.holder == "bulk" and actor in {None, "", "other"}):
-                    name = "Paperclip or other"
-                else:
-                    name = ACTOR_NAMES.get(actor or "", "")
-                    if not name:
-                        name = (actor or "").replace("-", " ") or (
-                            "Tanzu talk" if self.holder == "high" else "Paperclip or other"
-                        )
+            name = _actor_name(self.holder, actor) if self.holder else None
+            line = [
+                {
+                    "class": w["cls"],
+                    "actor": w["actor"],
+                    "name": _actor_name(w["cls"], w["actor"]),
+                    "process": w["process"],
+                    "since": _utc_iso(w["since"]),
+                    "waited_sec": int(max(0.0, now - w["since"])),
+                }
+                for w in self._line_locked()
+            ]
             return {
                 "holder": self.holder,
                 "holder_actor": actor,
                 "holder_name": name,
+                "holder_process": self.holder_process if self.holder else None,
+                "holder_since": _utc_iso(self.holder_since) if self.holder else None,
+                "holder_seconds": (
+                    int(max(0.0, now - self.holder_since)) if self.holder else None
+                ),
                 "busy": self.holder is not None,
                 "waiting": self.waiting_high + self.waiting_bulk,
                 "waiting_talk": self.waiting_high,
                 "waiting_other": self.waiting_bulk,
+                "queue": line,
+                "next": line[0] if line else None,
                 "demo_lease_remaining_sec": round(remaining, 1),
                 "preempts": self.preempts,
                 "demo_lock": bool(self.demo_lock),
@@ -267,47 +340,64 @@ class GpuSlot:
         except OSError:
             pass
 
-    def acquire(self, cls, wait_sec, actor=None):
+    def acquire(self, cls, wait_sec, actor=None, process=None):
         deadline = time.time() + max(0.0, float(wait_sec))
-        waiting = False
+        entry = None
         with self.cv:
             try:
                 while True:
                     now = time.time()
+                    ahead = self._someone_ahead_locked(cls, entry)
                     if cls == "high":
                         if self.holder == "bulk":
                             if not self.cancelled:
                                 self._cancel_locked()
-                        elif self.holder is None:
-                            return self._take_locked("high", actor)
+                        elif self.holder is None and not ahead:
+                            return self._take_locked("high", actor, process)
                     elif self.demo_lock:
                         return None
-                    elif self.holder is None and now >= self.demo_until:
-                        return self._take_locked("bulk", actor)
+                    elif self.holder is None and now >= self.demo_until and not ahead:
+                        return self._take_locked("bulk", actor, process)
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         return None
-                    if not waiting:
+                    if entry is None:
                         if cls == "high":
                             self.waiting_high += 1
                         else:
                             self.waiting_bulk += 1
-                        waiting = True
+                        self._seq += 1
+                        slug = _actor_slug(actor) if actor else ""
+                        entry = {
+                            "seq": self._seq,
+                            "cls": cls,
+                            "actor": slug or ("talk" if cls == "high" else "other"),
+                            "process": process,
+                            "since": now,
+                        }
+                        self.queue.append(entry)
                     self.cv.wait(timeout=min(remaining, 0.25))
             finally:
-                if waiting:
+                if entry is not None:
                     if cls == "high":
                         self.waiting_high = max(0, self.waiting_high - 1)
                     else:
                         self.waiting_bulk = max(0, self.waiting_bulk - 1)
+                    try:
+                        self.queue.remove(entry)
+                    except ValueError:
+                        pass
+                    self.cv.notify_all()
 
-    def _take_locked(self, cls, actor=None):
+    def _take_locked(self, cls, actor=None, process=None):
         self.ticket += 1
         self.holder = cls
         slug = _actor_slug(actor) if actor else ""
         if not slug:
             slug = "talk" if cls == "high" else "other"
         self.actor = slug
+        self.holder_since = time.time()
+        self.holder_process = process
         self.cancelled = False
         self.session = None
         self.upstream = None
@@ -352,6 +442,8 @@ class GpuSlot:
                 self.demo_until = time.time() + self.lease_sec
             self.holder = None
             self.actor = None
+            self.holder_since = 0.0
+            self.holder_process = None
             self.cancelled = False
             self.session = None
             self.upstream = None
@@ -792,7 +884,12 @@ def proxy(path):
     session = None
     if gated:
         wait = DEMO_WAIT_SEC if cls == "high" else BULK_WAIT_SEC
-        ticket = SLOT.acquire(cls, wait, actor=_client_actor())
+        ticket = SLOT.acquire(
+            cls,
+            wait,
+            actor=_client_actor(),
+            process=describe_process(clean_path, raw_body),
+        )
         if ticket is None:
             return _busy_response(cls)
         session = requests.Session()
